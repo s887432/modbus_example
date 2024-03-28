@@ -3,21 +3,9 @@
 #include <string.h>
 #include <stdlib.h>
 #include <errno.h>
-#include <signal.h>
-#include <time.h>
-#include <sys/stat.h>
-#include <sys/types.h>
 #include <fcntl.h>
-#include <pthread.h>
-#include <linux/input.h>
-
 #include <modbus/modbus.h>
-
-#define MODBUS_PORT	1503
-#define MODBUS_CONNECTIONS	5
-
-#define KEY_DEV				"/dev/input/event0"
-static int gKeyfd = -1;
+#include "modbus_ex.h"
 
 #define LED_RED_DEV			"/sys/class/leds/red/brightness"
 #define LED_GREEN_DEV		"/sys/class/leds/green/brightness"
@@ -26,18 +14,6 @@ static int gKeyfd = -1;
 static int gLedRedfd = -1;
 static int gLedGreenfd = -1;
 static int gLedBluefd = -1;
-
-#define MODBUS_DATA_POSITION_LED_RED	0
-#define MODBUS_DATA_POSITION_LED_GREEN	1
-#define MODBUS_DATA_POSITION_LED_BLUE	2
-#define MODBUS_DATA_POSITION_KEY		3
-
-typedef enum __LED_ID__
-{
-	LED_RED = 1,
-	LED_GREEN,
-	LED_BLUE
-}LED_ID;
 
 int ledInit(void)
 {
@@ -124,136 +100,101 @@ int ledClean(LED_ID id)
 	return 0;
 }
 
-int keyInit(void)
+int main(int argc, char*argv[])
 {
-	if( (gKeyfd = open(KEY_DEV, O_RDONLY)) <= 0 )
-	{
-		printf("open event error\r\n");
-		return -1;
-	}
-	
-	return 0;
-}
+    int s = -1;
+    modbus_t *ctx;
+    modbus_mapping_t *mb_mapping;
+    int rc;
+    int i;
+    uint8_t *query;
+    int header_length;
+    uint16_t addr;
+    uint16_t value;
+    pWriteSingleBit_t writeSingleBitValue;
+    uint8_t *ptrPackage;
+    
+    ledInit();
 
-void keyClose(void)
-{
-	close(gKeyfd);
-}
+    ctx = modbus_new_tcp(NULL, 1502);
+    query = malloc(MODBUS_TCP_MAX_ADU_LENGTH);
+    header_length = modbus_get_header_length(ctx);
+    
+    printf("MODBUS_TCP_MAX_ADU_LENGTH = %d\r\n", MODBUS_TCP_MAX_ADU_LENGTH);
+    printf("header_length = %d\r\n", header_length);
 
-void thread_proc(void *param)
-{
-	int keys_fd;
-	struct input_event t;
-	modbus_mapping_t *mb_mapping = (modbus_mapping_t *)param;
-	
-	while(1)
-	{
-		if( read(keys_fd, &t, sizeof(t)) == sizeof(t))
-		{
-			if( t.type == EV_KEY )
-			{
-				if( t.value ==0 || t.value == 1 )
-				{
-					printf("key %d %s (%d)\n", t.code, (t.value) ? "Pressed" : "Released", t.value);
-					
-					if( t.value == 0 )
-						mb_mapping->tab_registers[MODBUS_DATA_POSITION_KEY] = 1;
-						
-					if( t.code == KEY_ESC )
-					{
-						break;
-					}
-				}
-			}
-		}
-	}
-}
+    //modbus_set_debug(ctx, TRUE);
 
-int main(int argc, char **argv)
-{
-	modbus_t *ctx = NULL;
-	int server_socket;
-	uint8_t query[MODBUS_TCP_MAX_ADU_LENGTH];
-	modbus_mapping_t *mb_mapping;
-	int rc;
-	int i=0;
-	pthread_t threadID;
-	
-	if( ledInit() < 0 )
-	{
-		printf("Initial LED error......\r\n");
-	}
-	
-	if( keyInit() < 0 )
-	{
-		printf("Initial KEY error......\r\n");		
-	}
-	
-	memset(query, 0, MODBUS_TCP_MAX_ADU_LENGTH);
-	ctx = modbus_new_tcp(NULL, MODBUS_PORT);
-	
-	mb_mapping = modbus_mapping_new(0, 0, 500, 500);
-	if (mb_mapping == NULL) {
-		fprintf(stderr, "Failed to allocate the mapping: %s\n", modbus_strerror(errno));
-		modbus_free(ctx);
-		return -1;
-	}
-
-	if( (server_socket = modbus_tcp_listen(ctx, MODBUS_CONNECTIONS)) == -1 )
-	{
-		printf("Unable to listen TCP connection\r\n");
-		modbus_free(ctx);
-		return -1;
-	}
-	
-	if( pthread_create(&threadID, NULL, (void *) thread_proc, mb_mapping->tab_registers) != 0 )
-	{
-        printf ("Create key handler pthread error!n");
+    mb_mapping = modbus_mapping_new(
+        UT_BITS_ADDRESS + UT_BITS_NB,
+        UT_INPUT_BITS_ADDRESS + UT_INPUT_BITS_NB,
+        UT_REGISTERS_ADDRESS + UT_REGISTERS_NB,
+        UT_INPUT_REGISTERS_ADDRESS + UT_INPUT_REGISTERS_NB);
+    if (mb_mapping == NULL) {
+        fprintf(stderr, "Failed to allocate the mapping: %s\n",
+                modbus_strerror(errno));
+        modbus_free(ctx);
+        return -1;
     }
-	
-	while(1)
-	{
-		modbus_tcp_accept(ctx, &server_socket);
+
+    /** INPUT STATUS **/
+    modbus_set_bits_from_bytes(mb_mapping->tab_input_bits,
+                               UT_INPUT_BITS_ADDRESS, UT_INPUT_BITS_NB,
+                               UT_INPUT_BITS_TAB);
+
+    /** INPUT REGISTERS **/
+    for (i=0; i < UT_INPUT_REGISTERS_NB; i++) {
+        mb_mapping->tab_input_registers[UT_INPUT_REGISTERS_ADDRESS+i] =
+            UT_INPUT_REGISTERS_TAB[i];;
+    }
+
+    s = modbus_tcp_listen(ctx, 1);
+    modbus_tcp_accept(ctx, &s);
+
+    for (;;) {
+        do {
+            rc = modbus_receive(ctx, query);
+            /* Filtered queries return 0 */
+        } while (rc == 0);
+
+        if (rc == -1) {
+            /* Connection closed by the client or error */
+            break;
+        }
+
+		ptrPackage = query+header_length;
 		
-		while(1)
+		switch( *ptrPackage )
 		{
-			printf("%d---", i++);
-			rc = modbus_receive(ctx, query);
-			printf("SLAVE: regs[] =\t");
-			for(int i = 1; i < 10; i++) { // looks like 1..n index
-				printf("%d ", mb_mapping->tab_registers[i]);
-			}
-			printf("\r\n");
-			
-			if (rc > 0) {
-				/* rc is the query size */
-				modbus_reply(ctx, query, rc, mb_mapping);
-			}
-			else if (rc == -1) {
-				/* Connection closed by the client or error */
+			case 5:	
+				printf("*******************************************************************\r\n");
+				// write single coil
+				writeSingleBitValue = (pWriteSingleBit_t)(ptrPackage+1);				
+				printf("%d, %s\r\n", writeSingleBitValue->address, writeSingleBitValue->value==0xFF?"ON":"OFF");
+				
+				writeSingleBitValue->value==0xFF ? ledSet(LED_RED) : ledClean(LED_RED);
+				
 				break;
-			}
-			
-			mb_mapping->tab_registers[MODBUS_DATA_POSITION_LED_RED] == 0 ? ledClean(LED_RED) : ledSet(LED_RED);
-			mb_mapping->tab_registers[MODBUS_DATA_POSITION_LED_GREEN] == 0 ? ledClean(LED_GREEN) : ledSet(LED_GREEN);
-			mb_mapping->tab_registers[MODBUS_DATA_POSITION_LED_BLUE] == 0 ? ledClean(LED_BLUE) : ledSet(LED_BLUE);
 		}
 		
-		printf("Quit the loop: %s\n", modbus_strerror(errno));
-	}
-  
-	if (server_socket != -1) {
-		close(server_socket);
-	}
-	modbus_mapping_free(mb_mapping);
-	modbus_close(ctx);
-	modbus_free(ctx);
-  	
-  	ledClose();
-  	keyClose();
-  	
-	return 0;
+        rc = modbus_reply(ctx, query, rc, mb_mapping);
+        if (rc == -1) {
+            break;
+        }
+    }
+
+    printf("Quit the loop: %s\n", modbus_strerror(errno));
+
+    if (s != -1) {
+       close(s);
+    }
+    modbus_mapping_free(mb_mapping);
+    free(query);
+    /* For RTU */
+    modbus_close(ctx);
+    modbus_free(ctx);
+
+    return 0;
 }
 
 // end of file
-
